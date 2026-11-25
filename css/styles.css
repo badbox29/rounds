@@ -192,3 +192,10 @@ form.add { display: flex; gap: 8px; margin: 18px 0; }
   .modal-overlay { padding: 12px 8px; }
   nav button { padding: 8px 10px; font-size: 16px; }
 }
+@media (max-width: 440px) { .wide { display: none; } nav button { padding: 8px 8px; } .navrow { flex-wrap: nowrap; } }
+
+/* ── Passphrase dialog ───────────────────────────────────────── */
+.pp-warn { color: var(--gold2); font-weight: 500; margin: 0 0 8px; }
+.pp-err  { color: var(--red); font-weight: 600; min-height: 1.2em; margin: 0 0 8px; font-size: 15px; }
+#pp-forgot { margin-right: auto; }
+input[type=checkbox] { width: 18px; height: 18px; accent-color: var(--band); }
