@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#2f6d9e">
+  <title>Rounds</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%232f6d9e'/%3E%3Cpath d='M9 16.5l4.5 4.5L23 11' stroke='%23fff' stroke-width='3.2' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@600;700&family=Barlow:wght@400;500;600&display=swap" rel="stylesheet">
+
+  <!-- Google Identity Services. The client ID itself comes from the Worker (/auth/config). -->
+  <script src="https://accounts.google.com/gsi/client" async
+          onload="window.gisReady=true;window.dispatchEvent(new Event('gis-ready'))"></script>
+
+  <link rel="stylesheet" href="css/styles.css?v=2.0.1">
+</head>
+<body>
+
+<header class="band">
+  <div class="wrap">
+    <div class="top">
+      <div>
+        <h1>Rounds</h1>
+        <div class="date" id="date"></div>
+      </div>
+      <div class="top-right">
+        <div class="count" id="count"></div>
+      </div>
+    </div>
+    <div class="strip" id="strip" aria-hidden="true"></div>
+    <div class="navrow">
+      <nav aria-label="Views">
+        <button id="tabR" data-view="rounds">Today’s rounds</button>
+        <button id="tabA" data-view="archive">Archive</button>
+      </nav>
+      <div class="navtools">
+        <button class="sync-pill" id="syncPill" type="button" title="Sync status"></button>
+        <button class="icon-btn" id="btnSettings" type="button" aria-label="Settings">
+          <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 7h9M17 7h3M4 17h3M11 17h9"/><circle cx="15" cy="7" r="2"/><circle cx="9" cy="17" r="2"/></svg>
+        </button>
+      </div>
+    </div>
+  </div>
+</header>
+
+<div class="banner" id="banner" hidden></div>
+
+<main class="wrap" id="main"></main>
+
+<div class="toast" id="toast" hidden role="status"><span id="toastMsg"></span><button id="toastUndo" type="button">Undo</button></div>
+
+<!-- ── Account setup wizard (filled in by js/auth.js) ─────────────── -->
+<div class="modal-overlay" id="modal-account-setup" role="dialog" aria-modal="true" aria-labelledby="account-setup-title">
+  <div class="modal modal-sm">
+    <div class="modal-header">
+      <h2 class="modal-title" id="account-setup-title"></h2>
+    </div>
+    <div class="modal-body" id="account-setup-body"></div>
+  </div>
+</div>
+
+<!-- ── Settings ───────────────────────────────────────────────────── -->
+<div class="modal-overlay" id="modal-settings" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+  <div class="modal modal-sm">
+    <div class="modal-header">
+      <h2 class="modal-title" id="settings-title">Settings</h2>
+      <button class="modal-close" type="button" data-close="modal-settings" aria-label="Close">✕</button>
+    </div>
+    <div class="modal-body">
+
+      <section class="settings-section">
+        <div class="settings-section-header">
+          Account <span id="settings-auth-badge" class="auth-badge auth-badge-guest">Guest</span>
+        </div>
+
+        <div id="settings-guest-section">
+          <p class="f13 lh muted">You’re using Rounds as a guest, so everything stays on this device. Create an account to sync across devices.</p>
+        </div>
+
+        <div id="settings-token-group" style="display:none;">
+          <div class="form-label">Sync token</div>
+          <p class="form-hint" style="margin-top:0">Use this to sign in on another device. Keep it somewhere safe — it’s the only way back to your data.</p>
+          <div class="row gap-8">
+            <code id="settings-token-display" class="token-box">—</code>
+            <button class="btn btn-outline btn-sm" id="settings-token-copy" type="button">Copy</button>
+          </div>
+        </div>
+
+        <div id="settings-google-info" style="display:none;"></div>
+
+        <div id="settings-worker-group" style="display:none;">
+          <div class="form-group" style="margin:0">
+            <label class="form-label" for="settings-worker-url">Worker URL</label>
+            <div class="row gap-8">
+              <input class="input" id="settings-worker-url" placeholder="https://your-worker.workers.dev" style="flex:1">
+              <button class="btn btn-outline btn-sm" id="settings-worker-save" type="button">Save</button>
+            </div>
+            <div class="form-hint">Your own Cloudflare Worker. Saved in this browser only — it isn’t in the app’s code and is never uploaded.</div>
+          </div>
+        </div>
+
+        <div id="settings-sync-controls" style="display:none;">
+          <div class="settings-row">
+            <div>
+              <div class="settings-row-label">Sync now</div>
+              <div class="settings-row-sub" id="settings-sync-info"></div>
+            </div>
+            <button class="btn btn-outline btn-sm" id="settings-sync-now" type="button">Sync</button>
+          </div>
+        </div>
+
+        <div id="settings-upgrade-google" style="display:none;">
+          <button class="btn btn-ghost btn-sm" id="settings-upgrade-btn" type="button">Upgrade to Google sign-in →</button>
+        </div>
+
+        <div class="settings-actions">
+          <button class="btn btn-ghost btn-sm" id="settings-account-btn" type="button">Switch / create account</button>
+          <button class="btn btn-ghost btn-sm" id="settings-signout-all" type="button" style="display:none;">Sign out on all devices</button>
+        </div>
+      </section>
+
+      <section class="settings-section">
+        <div class="settings-section-header">Your data</div>
+        <div class="settings-row">
+          <div>
+            <div class="settings-row-label">Copy backup</div>
+            <div class="settings-row-sub">All tasks and notes as JSON.</div>
+          </div>
+          <button class="btn btn-outline btn-sm" id="settings-export" type="button">Copy</button>
+        </div>
+      </section>
+
+      <p class="f13 muted" id="app-version" style="margin:.5rem 0 0"></p>
+    </div>
+  </div>
+</div>
+
+<!-- ── Confirm dialog ─────────────────────────────────────────────── -->
+<div class="modal-overlay" id="modal-confirm" role="alertdialog" aria-modal="true" aria-labelledby="confirm-title">
+  <div class="modal modal-sm">
+    <div class="modal-header"><h2 class="modal-title" id="confirm-title"></h2></div>
+    <div class="modal-body">
+      <p class="lh" id="confirm-msg" style="white-space:pre-line;margin-top:0"></p>
+      <div class="row gap-8" id="confirm-copy" style="display:none;margin-bottom:1rem">
+        <code class="token-box" id="confirm-copy-value"></code>
+        <button class="btn btn-outline btn-sm" id="confirm-copy-btn" type="button">Copy</button>
+      </div>
+      <div class="form-actions">
+        <button class="btn btn-ghost" id="confirm-cancel" type="button">Cancel</button>
+        <button class="btn btn-primary" id="confirm-ok" type="button">OK</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="js/auth.js?v=2.0.1"></script>
+<script src="js/app.js?v=2.0.1"></script>
+</body>
+</html>
