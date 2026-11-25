@@ -23,6 +23,11 @@
  *   POST   /auth/register       — Register a token account's signing key (and move pre-v2.1 data)
  *   POST   /auth/migrate        — One-way token → Google migration (HMAC-authenticated)
  *
+ * Morning reminders (optional): add a Cron Trigger that runs every 5 minutes to the
+ * Worker (see README). Each run sends an ntfy notification to every account whose
+ * reminder time has come (in its own timezone), at most once a day.
+ * Settings live at user:{id}:reminder, with an index key rindex:{id}.
+ *
  * Account ids:
  *   google:{sub}  — Google accounts (signed with a Worker-minted write key)
  *   r1{43 chars}  — token accounts: a SHA-256 fingerprint of the token. The
@@ -30,6 +35,7 @@
  *                   with a key the client derives from it and registers once.
  *   {22 chars}    — pre-v2.1 token accounts stored under the raw token. Still
  *                   readable until /auth/register moves them, then 410.
+ *   POST   /reminder/:id/test   — Send a test reminder with the given settings (signed)
  *   GET    /storage/:token      — List keys for an account
  *   GET    /storage/:token/:key — Read a value
  *   PUT    /storage/:token/:key — Write a value (signed)
@@ -380,6 +386,11 @@ async function handleAuth(url, method, request, env, cors, ip) {
     });
     await deleteAccountKeys(kv, oldId);
     await kv.delete(writeKeyId(oldId));
+    // Keep a morning reminder running under the new account id.
+    if (await kv.get(`rindex:${oldId}`, { type: 'text' })) {
+      await kv.put(`rindex:${kvKey}`, '1');
+      await kv.delete(`rindex:${oldId}`);
+    }
     // Other devices still on the old token get a 410 and are sent to Google sign-in.
     await kv.put(`migrated:${oldId}`, kvKey, { expirationTtl: MIGRATED_TTL });
 
@@ -449,6 +460,17 @@ async function handleStorage(request, env, pathname, cors) {
     const auth = await checkAuth(request, token, cors, bodyText, env);
     if (!auth.ok) return auth.res;
 
+    if (userKey === 'reminder') {
+      let prev = null;
+      try { prev = JSON.parse(await kv.get(kvKey, { type: 'text' }) || 'null'); } catch {}
+      const clean = cleanReminder(parsed, prev);
+      if (clean.error) return respond({ error: clean.error }, 400, cors);
+      await kv.put(kvKey, JSON.stringify(clean.value), { expirationTtl: KV_TTL });
+      if (clean.value.enabled) await kv.put(`rindex:${token}`, '1');
+      else await kv.delete(`rindex:${token}`);
+      return respond({ ok: true, value: clean.value }, 200, cors);
+    }
+
     await kv.put(kvKey, JSON.stringify(parsed), { expirationTtl: KV_TTL });
     return respond({ ok: true }, 200, cors);
   }
@@ -457,10 +479,127 @@ async function handleStorage(request, env, pathname, cors) {
     const auth = await checkAuth(request, token, cors, '', env);
     if (!auth.ok) return auth.res;
     await kv.delete(kvKey);
+    if (userKey === 'reminder') await kv.delete(`rindex:${token}`);
     return respond({ ok: true }, 200, cors);
   }
 
   return respond({ error: 'Method not allowed' }, 405, cors);
+}
+
+// ── Morning reminders (ntfy) ───────────────────────────────────────────────
+
+const REMINDER_GRACE_MIN = 60;   // a missed cron run can still send up to an hour late
+const DOW = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
+
+// The wall-clock date, weekday and minute-of-day in a timezone. Intl handles
+// daylight saving, so a reminder stays at the same local time all year.
+function localParts(ms, tz) {
+  const f = new Intl.DateTimeFormat('en-US', {
+    timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit',
+    weekday: 'short', hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+  });
+  const p = Object.fromEntries(f.formatToParts(new Date(ms)).map(x => [x.type, x.value]));
+  return { date: `${p.year}-${p.month}-${p.day}`, dow: DOW[p.weekday], minutes: (+p.hour % 24) * 60 + (+p.minute) };
+}
+const toMinutes = hhmm => { const [h, m] = hhmm.split(':').map(Number); return h * 60 + m; };
+
+// Validate and normalise reminder settings from the app. Keeps lastSent from
+// the stored copy, and if the time has already passed today, counts today as
+// done so saving at 8:20 for 8:00 doesn't fire immediately.
+function cleanReminder(r, prev, now = Date.now()) {
+  if (!r || typeof r !== 'object') return { error: 'Invalid settings' };
+  const time = /^([01]\d|2[0-3]):[0-5]\d$/.test(r.time || '') ? r.time : null;
+  if (!time) return { error: 'Time must be HH:MM' };
+  const days = Array.isArray(r.days) ? [...new Set(r.days.filter(d => Number.isInteger(d) && d >= 0 && d <= 6))].sort() : [];
+  if (r.enabled && !days.length) return { error: 'Pick at least one day' };
+  const tz = typeof r.tz === 'string' ? r.tz : '';
+  try { new Intl.DateTimeFormat('en-US', { timeZone: tz }); } catch { return { error: 'Unknown timezone' }; }
+  let server;
+  try {
+    const u = new URL(String(r.server || 'https://ntfy.sh'));
+    if (u.protocol !== 'https:') return { error: 'ntfy server must use https://' };
+    server = u.origin + u.pathname.replace(/\/+$/, '');
+  } catch { return { error: 'Invalid ntfy server URL' }; }
+  const topic = String(r.topic || '');
+  if (!/^[A-Za-z0-9_-]{1,64}$/.test(topic)) return { error: 'Topic: 1–64 letters, numbers, - or _' };
+  const tokenStr = String(r.token || '');
+  if (tokenStr.length > 200 || /[^\x21-\x7e]/.test(tokenStr)) return { error: 'Invalid access token' };
+  let appUrl = '';
+  try { if (r.appUrl) { const u = new URL(String(r.appUrl)); if (u.protocol === 'https:' || u.hostname === 'localhost') appUrl = u.href.slice(0, 300); } } catch {}
+
+  const value = { enabled: !!r.enabled, time, days, tz, server, topic, token: tokenStr, appUrl, lastSent: prev?.lastSent || '' };
+  const lp = localParts(now, tz);
+  if (value.enabled && lp.minutes >= toMinutes(time)) value.lastSent = lp.date;
+  return { value };
+}
+
+async function sendNtfy(r, test = false) {
+  const headers = { 'Content-Type': 'application/json' };
+  if (r.token) headers.Authorization = `Bearer ${r.token}`;
+  const msg = {
+    topic: r.topic,
+    title: 'Rounds',
+    message: test ? 'Test reminder — notifications are working.' : 'Time to make your rounds.',
+    tags: ['clipboard'],
+  };
+  if (r.appUrl) msg.click = r.appUrl;
+  try {
+    const res = await fetch(r.server + '/', { method: 'POST', headers, body: JSON.stringify(msg), signal: AbortSignal.timeout(10000) });
+    return { ok: res.ok, status: res.status };
+  } catch (e) {
+    return { ok: false, status: 0, error: String(e && e.message || e) };
+  }
+}
+
+// Cron entry: send every reminder that's due now.
+async function runReminders(env, now) {
+  const kv = env[KV_BINDING];
+  let cursor, sent = 0;
+  do {
+    const listed = await kv.list({ prefix: 'rindex:', cursor });
+    for (const k of listed.keys) {
+      const id  = k.name.slice('rindex:'.length);
+      const key = `user:${id}:reminder`;
+      let r = null;
+      try { r = JSON.parse(await kv.get(key, { type: 'text' }) || 'null'); } catch {}
+      if (!r || !r.enabled) { await kv.delete(k.name); continue; }
+      let lp;
+      try { lp = localParts(now, r.tz); } catch { continue; }
+      const target = toMinutes(r.time);
+      if (!r.days.includes(lp.dow)) continue;
+      if (lp.minutes < target || lp.minutes >= target + REMINDER_GRACE_MIN) continue;
+      if (r.lastSent === lp.date) continue;
+      const res = await sendNtfy(r);
+      // On failure, leave lastSent alone so the next run (within the grace
+      // window) tries again.
+      if (res.ok) { r.lastSent = lp.date; r.lastError = ''; sent++; }
+      else r.lastError = `${new Date(now).toISOString()} HTTP ${res.status}${res.error ? ' ' + res.error : ''}`;
+      await kv.put(key, JSON.stringify(r), { expirationTtl: KV_TTL });
+    }
+    cursor = listed.list_complete ? undefined : listed.cursor;
+  } while (cursor);
+  return sent;
+}
+
+// POST /reminder/:id/test — send a test with the settings in the body (signed
+// like a storage write), so the app can test before saving.
+async function handleReminderTest(request, env, pathname, cors) {
+  const parts = pathname.split('/').filter(Boolean);    // ['reminder', id, 'test']
+  if (parts.length !== 3 || parts[2] !== 'test' || request.method.toUpperCase() !== 'POST')
+    return respond({ error: 'Not found' }, 404, cors);
+  const id = decodeURIComponent(parts[1]);
+  if (!isValidToken(id) || isLegacyId(id)) return respond({ error: 'Invalid account id' }, 400, cors);
+  const bodyText = await readBodyText(request);
+  let body;
+  try { body = JSON.parse(bodyText || ''); } catch { return respond({ error: 'Invalid JSON' }, 400, cors); }
+  const auth = await checkAuth(request, id, cors, bodyText, env);
+  if (!auth.ok) return auth.res;
+  const rl = await slidingLimit(env, `rl:rtest:${id}`, 10, 3600);
+  if (rl) return tooMany(rl, cors);
+  const clean = cleanReminder({ ...body, enabled: false }, null);
+  if (clean.error) return respond({ error: clean.error }, 400, cors);
+  const res = await sendNtfy(clean.value, true);
+  return respond({ ok: res.ok, status: res.status, error: res.ok ? undefined : (res.error || `ntfy returned HTTP ${res.status}`) }, 200, cors);
 }
 
 // ── Body helper ────────────────────────────────────────────────────────────
@@ -505,10 +644,20 @@ export default {
       if (url.pathname === '/storage' || url.pathname.startsWith('/storage/')) {
         return await handleStorage(request, env, url.pathname.replace(/\/$/, ''), cors);
       }
+      if (url.pathname.startsWith('/reminder/')) {
+        return await handleReminderTest(request, env, url.pathname.replace(/\/$/, ''), cors);
+      }
       return respond({ error: 'Not found' }, 404, cors);
     } catch (err) {
       console.error('Worker error:', err);
       return respond({ error: 'Internal server error' }, 500, cors);
     }
   },
+
+  // Cron Trigger ("*/5 * * * *") — morning reminders.
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(runReminders(env, event.scheduledTime || Date.now()));
+  },
 };
+
+export { runReminders, cleanReminder, localParts };   // for tests
