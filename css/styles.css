@@ -107,7 +107,17 @@ textarea { resize: vertical; min-height: 72px; }
 }
 
 /* ── Board ───────────────────────────────────────────────────── */
-form.add { display: flex; gap: 8px; margin: 18px 0; }
+form.add { display: grid; gap: 8px; margin: 18px 0; }
+.add-row { display: flex; gap: 8px; }
+.link-btn {
+  justify-self: start; background: none; border: 0; padding: 4px 2px; min-height: 36px;
+  color: var(--seen); font: 600 15px Barlow, system-ui, sans-serif; cursor: pointer;
+}
+.desc { background: var(--soft); border-left: 3px solid var(--seen); border-radius: 8px; padding: 10px 12px; }
+.desc-label { font-size: 13px; font-weight: 600; color: var(--muted); }
+.desc p { margin: 2px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+form.edit { display: grid; gap: 6px; }
+form.edit .form-label { margin: 4px 0 0; }
 .list { display: grid; gap: 10px; margin: 0; padding: 0 0 48px; list-style: none; }
 .card { background: var(--paper); border: 1.5px solid var(--line); border-radius: 14px; overflow: hidden; }
 .card.open { border-color: var(--seen); }
