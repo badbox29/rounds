@@ -8,7 +8,7 @@
  */
 'use strict';
 
-const APP_VERSION         = '2.1.0';
+const APP_VERSION         = '2.2.0';
 // The Worker URL is never built in. Each browser stores its own (entered in
 // the setup wizard or Settings) in localStorage, so anyone can run this page
 // from the same GitHub repo against their own private Worker. It is never
@@ -68,7 +68,7 @@ const App = {
 };
 const View = {
   tab: location.hash === '#archive' ? 'archive' : 'rounds',
-  open: new Set(), drafts: {}, renaming: null, q: '',
+  open: new Set(), drafts: {}, editing: null, addDesc: false, q: '',
 };
 
 // ── Data shape ────────────────────────────────────────────────────
@@ -564,14 +564,18 @@ function card(id, it, archived) {
     const log = notes.length
       ? `<ol class="log">${notes.map(x => `<li><button class="x" type="button" data-act="delnote" data-n="${esc(x.id)}" aria-label="Remove note">Remove</button><time>${esc(fmt(x.at))}</time><p class="${x.text ? '' : 'empty'}">${x.text ? esc(x.text) : 'Checked in, no notes'}</p></li>`).join('')}</ol>`
       : '<p class="meta" style="margin:0">No notes yet.</p>';
-    const rename = View.renaming === id
-      ? `<form class="note-row" data-act="rename-save"><input id="r-${sid}" value="${esc(it.title)}" aria-label="New name" maxlength="200"><button class="btn pri">Save</button><button type="button" class="btn btn-ghost" data-act="rename-cancel">Cancel</button></form>`
-      : '';
+    // Title + description editor. Drafts survive re-renders from sync.
+    const editing = View.editing === id;
+    const dt = View.drafts['t:' + id] ?? it.title, dd = View.drafts['d:' + id] ?? (it.description || '');
+    const top = editing
+      ? `<form class="edit" data-act="edit-save"><label class="form-label" for="r-${sid}">Title</label><input id="r-${sid}" value="${esc(dt)}" maxlength="200"><label class="form-label" for="d-${sid}">Description</label><textarea id="d-${sid}" rows="3" maxlength="2000" placeholder="Completion requirements — what does done look like?">${esc(dd)}</textarea><div class="note-row"><button class="btn pri">Save</button><button type="button" class="btn btn-ghost" data-act="edit-cancel">Cancel</button></div></form>`
+      : (it.description ? `<div class="desc"><div class="desc-label">Description</div><p>${esc(it.description)}</p></div>` : '');
+    const editBtn = `<button class="btn btn-ghost" type="button" data-act="edit">${it.description ? 'Edit' : 'Edit / add description'}</button>`;
     body = archived
-      ? `<div class="body">${log}<div class="actions"><button class="btn pri" type="button" data-act="reopen">Put back on rounds</button><button class="btn red btn-ghost" type="button" data-act="delete">Delete</button></div></div>`
-      : `<div class="body">${rename}<form data-act="note"><textarea id="n-${sid}" placeholder="What’s the status today?" aria-label="Today’s note">${esc(View.drafts[id] || '')}</textarea><div class="note-row"><button class="btn pri">Log note</button><button type="button" class="btn" data-act="touch">Seen, no notes</button></div></form>${log}<div class="actions"><button class="btn" type="button" data-act="done">Mark done &amp; archive</button><button class="btn btn-ghost" type="button" data-act="rename">Rename</button><button class="btn red btn-ghost" type="button" data-act="delete">Delete</button></div></div>`;
+      ? `<div class="body">${top}${log}<div class="actions"><button class="btn pri" type="button" data-act="reopen">Put back on rounds</button>${editBtn}<button class="btn red btn-ghost" type="button" data-act="delete">Delete</button></div></div>`
+      : `<div class="body">${top}<form data-act="note"><textarea id="n-${sid}" placeholder="What’s the status today?" aria-label="Today’s note">${esc(View.drafts[id] || '')}</textarea><div class="note-row"><button class="btn pri">Log note</button><button type="button" class="btn" data-act="touch">Seen, no notes</button></div></form>${log}<div class="actions"><button class="btn" type="button" data-act="done">Mark done &amp; archive</button>${editBtn}<button class="btn red btn-ghost" type="button" data-act="delete">Delete</button></div></div>`;
   }
-  return `<li class="card${seen ? ' seen' : ''}${isOpen ? ' open' : ''}" data-id="${sid}"><button class="head" type="button" data-act="toggle" aria-expanded="${isOpen}"><span class="tick">${seen ? '✓' : ''}</span><span class="t">${esc(it.title)}</span><span class="meta">${meta}</span>${!isOpen && n && n.text ? `<span class="peek">${esc(n.text)}</span>` : ''}</button>${body}</li>`;
+  return `<li class="card${seen ? ' seen' : ''}${isOpen ? ' open' : ''}" data-id="${sid}"><button class="head" type="button" data-act="toggle" aria-expanded="${isOpen}"><span class="tick">${seen ? '✓' : ''}</span><span class="t">${esc(it.title)}</span><span class="meta">${meta}</span>${isOpen ? '' : (n && n.text ? `<span class="peek">${esc(n.text)}</span>` : (it.description ? `<span class="peek">${esc(it.description)}</span>` : ''))}</button>${body}</li>`;
 }
 
 function render() {
@@ -597,7 +601,9 @@ function render() {
   if (View.tab === 'rounds') {
     active.sort(([, x], [, y]) =>
       (seenToday(x) - seenToday(y)) || ((lastNote(x)?.at || 0) - (lastNote(y)?.at || 0)) || (x.createdAt - y.createdAt));
-    h = `<form class="add" data-act="add"><input id="newTitle" placeholder="Add something to check on daily" aria-label="New item" maxlength="200" autocomplete="off" value="${esc(View.drafts.__new || '')}"><button class="btn pri">Add</button></form>`;
+    h = `<form class="add" data-act="add"><div class="add-row"><input id="newTitle" placeholder="Add something to check on daily" aria-label="New item" maxlength="200" autocomplete="off" value="${esc(View.drafts.__new || '')}"><button class="btn pri">Add</button></div>${View.addDesc
+      ? `<textarea id="newDesc" rows="2" maxlength="2000" aria-label="Description (optional)" placeholder="Description (optional) — completion requirements, what done looks like">${esc(View.drafts.__newDesc || '')}</textarea>`
+      : '<button type="button" class="link-btn" data-act="add-desc">+ Add a description</button>'}</form>`;
     if (active.length) {
       if (seenN === active.length) h += '<p class="done-line">Rounds complete for today.</p>';
       h += `<ol class="list">${active.map(([id, it]) => card(id, it, false)).join('')}</ol>`;
@@ -607,9 +613,9 @@ function render() {
   } else {
     const q = View.q.toLowerCase();
     const list = done
-      .filter(([, it]) => !q || it.title.toLowerCase().includes(q) || (it.notes || []).some(n => (n.text || '').toLowerCase().includes(q)))
+      .filter(([, it]) => !q || it.title.toLowerCase().includes(q) || (it.description || '').toLowerCase().includes(q) || (it.notes || []).some(n => (n.text || '').toLowerCase().includes(q)))
       .sort(([, x], [, y]) => (y.doneAt || 0) - (x.doneAt || 0));
-    h = `<form class="add" data-act="noop"><input id="search" type="search" placeholder="Search archived items and notes" aria-label="Search archive" value="${esc(View.q)}"></form>`;
+    h = `<form class="add" data-act="noop"><input id="search" type="search" placeholder="Search archived items, descriptions and notes" aria-label="Search archive" value="${esc(View.q)}"></form>`;
     h += list.length
       ? `<ol class="list">${list.map(([id, it]) => card(id, it, true)).join('')}</ol>`
       : `<div class="empty-state"><strong>${q ? 'No matches' : 'Nothing archived yet'}</strong>${q ? 'Try another word.' : 'Items you mark done land here with their full history.'}</div>`;
@@ -649,9 +655,13 @@ function onMainClick(e) {
   const li = b.closest('.card'), id = li?.dataset.id, act = b.dataset.act;
   const it = id ? App.data.items[id] : null;
 
+  if (act === 'add-desc') {
+    View.addDesc = true; render(); $('newDesc')?.focus();
+    return;
+  }
   if (act === 'toggle') {
     View.open.has(id) ? View.open.delete(id) : View.open.add(id);
-    if (View.renaming === id && !View.open.has(id)) View.renaming = null;
+    if (View.editing === id && !View.open.has(id)) clearEdit(id);
     render();
     if (View.open.has(id) && matchMedia('(hover: hover)').matches) $('n-' + id)?.focus();
     return;
@@ -687,12 +697,18 @@ function onMainClick(e) {
       cur.notes = [...(cur.notes || []), { ...gone, id: newId() }].sort((x, y) => x.at - y.at);
       saveTask(id, cur);
     });
-  } else if (act === 'rename') {
-    View.renaming = id; render();
-    const r = $('r-' + id); if (r) { r.focus(); r.select(); }
-  } else if (act === 'rename-cancel') {
-    View.renaming = null; render();
+  } else if (act === 'edit') {
+    View.editing = id; render();
+    $((it.description ? 'd-' : 'r-') + id)?.focus();
+  } else if (act === 'edit-cancel') {
+    clearEdit(id); render();
   }
+}
+
+function clearEdit(id) {
+  View.editing = null;
+  delete View.drafts['t:' + id];
+  delete View.drafts['d:' + id];
 }
 
 function onMainSubmit(e) {
@@ -700,10 +716,15 @@ function onMainSubmit(e) {
   const f = e.target, act = f.dataset.act;
   if (act === 'add') {
     const v = $('newTitle').value.trim();
-    if (!v) return;
+    if (!v) { $('newTitle').focus(); return; }
+    const desc = ($('newDesc')?.value || '').trim();
     const id = newId(), now = Date.now();
     delete View.drafts.__new;
-    saveTask(id, { title: v, createdAt: now, status: 'active', notes: [], deletedNotes: [] });
+    delete View.drafts.__newDesc;
+    View.addDesc = false;
+    const t = { title: v, createdAt: now, status: 'active', notes: [], deletedNotes: [] };
+    if (desc) t.description = desc;
+    saveTask(id, t);
     $('newTitle')?.focus();
     return;
   }
@@ -712,23 +733,33 @@ function onMainSubmit(e) {
   if (act === 'note') {
     const v = $('n-' + id).value;
     if (v.trim()) logNote(id, v);
-  } else if (act === 'rename-save') {
-    const v = $('r-' + id).value.trim();
-    View.renaming = null;
-    if (v && v !== it.title) { const t = clone(it); t.title = v; saveTask(id, t); }
-    else render();
+  } else if (act === 'edit-save') {
+    const title = $('r-' + id).value.trim();
+    const desc  = $('d-' + id).value.trim();
+    if (!title) { $('r-' + id).focus(); toast('An item needs a title.'); return; }
+    clearEdit(id);
+    if (title === it.title && desc === (it.description || '')) { render(); return; }
+    const before = clone(it), t = clone(it);
+    t.title = title;
+    if (desc) t.description = desc; else delete t.description;
+    saveTask(id, t);
+    toast('Saved', () => saveTask(id, clone(before)));
   }
 }
 
 function onMainInput(e) {
   const t = e.target;
   if (t.id === 'newTitle') View.drafts.__new = t.value;
+  else if (t.id === 'newDesc') View.drafts.__newDesc = t.value;
+  else if (t.id.startsWith('r-')) View.drafts['t:' + t.id.slice(2)] = t.value;
+  else if (t.id.startsWith('d-')) View.drafts['d:' + t.id.slice(2)] = t.value;
   else if (t.id === 'search') { View.q = t.value; render(); }
   else if (t.id.startsWith('n-')) View.drafts[t.id.slice(2)] = t.value;
 }
 
 function setTab(tab) {
-  View.tab = tab; View.open.clear(); View.renaming = null;
+  View.tab = tab; View.open.clear();
+  if (View.editing) clearEdit(View.editing);
   try { history.replaceState(null, '', tab === 'archive' ? '#archive' : location.pathname + location.search); } catch {}
   render();
 }
