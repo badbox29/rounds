@@ -15,6 +15,7 @@ No build tools, no npm, no framework. Static files on GitHub Pages and a Cloudfl
 - **Undo** on check-ins, archiving, deleting and note removal. It still works after the change has synced.
 - **Descriptions**: give an item an optional description — completion requirements, what done looks like — when you add it (**+ Add a description**) or later with **Edit**. It shows at the top of the open card (and as the preview until the first note), and archive search covers it.
 - **Edit** (title and description) and **delete** items, remove individual notes.
+- **Morning reminder** (optional): your Worker sends a "Time to make your rounds" notification through [ntfy](https://ntfy.sh) at a time, days and timezone you choose in Settings. One ntfy subscription reaches your phone and desktop. Includes **Send test**.
 - **Copy backup**: Settings → Your data copies every item and note as JSON.
 - **Light and dark mode** follow the system setting.
 
@@ -93,7 +94,17 @@ If someone else runs Rounds from your Pages site against their own Worker, they 
 
 > **Shared origin:** every app under `badbox29.github.io` shares one browser storage quota and one `localStorage`. Rounds prefixes all its keys with `rounds_` and uses its own write-key slot, so it won't collide with Refectory. Its data is tiny, but if a neighbouring app fills the quota Rounds shows a banner rather than silently losing writes.
 
-### 6. First run
+### 6. Morning reminders (optional)
+
+1. Worker → **Settings → Triggers → Cron Triggers → Add**, schedule `*/5 * * * *` (every 5 minutes). Without it, Send test still works but scheduled reminders never fire.
+2. Install the **ntfy** app (iOS, Android, or [ntfy.sh/app](https://ntfy.sh/app) on desktop) and subscribe to the topic shown in Rounds → Settings → Morning reminder. Subscribe on every device you want reminded.
+3. In Rounds, turn the reminder on, pick the time, days and timezone, tap **Send test**, then **Save reminder**.
+
+Using your own ntfy server: it must be reachable from Cloudflare over HTTPS. For iPhone notifications, a self-hosted server needs `upstream-base-url: "https://ntfy.sh"` in its config (Apple only delivers instant pushes through ntfy.sh's relay). If you set `auth-default-access: deny-all`, create a token with publish rights and paste it into **Access token**.
+
+How it behaves: reminders follow your timezone through daylight-saving changes, send at most once a day, and retry on later runs for up to an hour if ntfy can't be reached. Saving after today's time has passed starts tomorrow. The free Workers plan covers this easily (288 runs a day).
+
+### 7. First run
 
 Open the app and choose **No — start fresh**, enter your Worker URL, then **Use Token** or **Link Google Account**. On other devices choose **Yes — load my existing account** and enter the same Worker URL.
 
@@ -108,6 +119,8 @@ Open the app and choose **No — start fresh**, enter your Worker URL, then **Us
 - **Google accounts.** The Worker verifies the Google ID token (RS256 against Google's published keys) once, then mints a random per-account **write key** used to sign requests, so sync keeps working after the 1-hour Google token expires. **Sign out on all devices** in Settings deletes the write key. Google identifies *who* you are; your passphrase is still what protects the data.
 - **Token → Google upgrade** requires a valid Google sign-in plus a request signed as the token account. The encrypted data moves as-is, so the passphrase keeps working. Afterwards the old account id returns `410 Gone`.
 - CORS is locked to `ALLOWED_ORIGINS`. `/auth/*` routes are rate-limited per IP; storage is rate-limited per account.
+
+**Reminder settings are not end-to-end encrypted.** The Worker has to read them to send, so `user:{id}:reminder` holds the time, days, timezone, ntfy server, topic and access token in plain form. They contain no task data, and the notification text is generic for the same reason: the Worker can't read your list.
 
 **What it doesn't protect against:** someone with access to an unlocked device or browser profile (data, token and data key sit in the browser's storage), or a compromised copy of the app's own code — the page is trusted, and so is Google's sign-in script it loads.
 
@@ -133,6 +146,8 @@ Deploy the new `worker.js` and the new site files together; nothing else changes
 | `POST` | `/auth/revokekeys` | Delete the write key (signs out every device) |
 | `POST` | `/auth/register` | Register a token account's signing key (and move a pre-v2.1 account) |
 | `POST` | `/auth/migrate` | One-way token → Google migration |
+| `POST` | `/reminder/:id/test` | Send a test reminder with the posted settings (signed) |
+| — | Cron `*/5 * * * *` | Send due morning reminders |
 | `GET` | `/storage/:token` | List keys |
 | `GET` | `/storage/:token/:key` | Read a value |
 | `PUT` | `/storage/:token/:key` | Write a value |
