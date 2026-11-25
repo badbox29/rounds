@@ -13,7 +13,7 @@
   <script src="https://accounts.google.com/gsi/client" async
           onload="window.gisReady=true;window.dispatchEvent(new Event('gis-ready'))"></script>
 
-  <link rel="stylesheet" href="css/styles.css?v=2.0.1">
+  <link rel="stylesheet" href="css/styles.css?v=2.1.0">
 </head>
 <body>
 
@@ -31,7 +31,7 @@
     <div class="strip" id="strip" aria-hidden="true"></div>
     <div class="navrow">
       <nav aria-label="Views">
-        <button id="tabR" data-view="rounds">Today’s rounds</button>
+        <button id="tabR" data-view="rounds">Today<span class="wide">’s rounds</span></button>
         <button id="tabA" data-view="archive">Archive</button>
       </nav>
       <div class="navtools">
@@ -120,6 +120,12 @@
         </div>
       </section>
 
+      <section class="settings-section" id="settings-e2e" style="display:none;">
+        <div class="settings-section-header">End-to-end encryption</div>
+        <p class="f13 lh muted" id="settings-e2e-status" style="margin:0"></p>
+        <div><button class="btn btn-outline btn-sm" id="settings-e2e-btn" type="button">Change passphrase</button></div>
+      </section>
+
       <section class="settings-section">
         <div class="settings-section-header">Your data</div>
         <div class="settings-row">
@@ -133,6 +139,33 @@
 
       <p class="f13 muted" id="app-version" style="margin:.5rem 0 0"></p>
     </div>
+  </div>
+</div>
+
+<!-- ── Passphrase ─────────────────────────────────────────────────── -->
+<div class="modal-overlay" id="modal-passphrase" role="dialog" aria-modal="true" aria-labelledby="pp-title">
+  <div class="modal modal-sm">
+    <div class="modal-header"><h2 class="modal-title" id="pp-title"></h2></div>
+    <form class="modal-body" id="pp-form" autocomplete="on">
+      <p class="lh" id="pp-intro" style="margin-top:0"></p>
+      <input type="text" name="username" autocomplete="username" value="Rounds sync" hidden>
+      <div class="form-group">
+        <label class="form-label" for="pp-1" id="pp-1-label">Passphrase</label>
+        <input class="input" id="pp-1" type="password" autocomplete="new-password" spellcheck="false" autocapitalize="off">
+      </div>
+      <div class="form-group" id="pp-2-group">
+        <label class="form-label" for="pp-2">Type it again</label>
+        <input class="input" id="pp-2" type="password" autocomplete="new-password" spellcheck="false" autocapitalize="off">
+      </div>
+      <label class="row gap-8 f13 muted" style="margin:-4px 0 12px"><input type="checkbox" id="pp-show"> Show passphrase</label>
+      <p class="form-hint pp-warn" id="pp-warn">If you forget it, your synced data can’t be recovered by anyone — save it in a password manager.</p>
+      <p class="pp-err" id="pp-err" role="alert"></p>
+      <div class="form-actions">
+        <button class="btn btn-ghost" id="pp-forgot" type="button">Forgot it?</button>
+        <button class="btn btn-ghost" id="pp-later" type="button">Not now</button>
+        <button class="btn btn-primary" id="pp-ok" type="submit">OK</button>
+      </div>
+    </form>
   </div>
 </div>
 
@@ -154,7 +187,7 @@
   </div>
 </div>
 
-<script src="js/auth.js?v=2.0.1"></script>
-<script src="js/app.js?v=2.0.1"></script>
+<script src="js/auth.js?v=2.1.0"></script>
+<script src="js/app.js?v=2.1.0"></script>
 </body>
 </html>

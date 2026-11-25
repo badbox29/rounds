@@ -23,6 +23,8 @@ No build tools, no npm, no framework. Static files on GitHub Pages and a Cloudfl
 - **Token**: a 128-bit token is your identity. Copy it from Settings to sign in on another device.
 - **Google**: sign in with Google, either from the start or as a one-way upgrade from a token account.
 
+Every synced account is **end-to-end encrypted** with a passphrase you choose. You enter it once per device; it never leaves the device, and your Worker only stores ciphertext. **If you forget it, synced data can't be recovered** — a device that still has the data can replace the synced copy under a new passphrase (Settings or "Forgot it?").
+
 Sync is pull → merge → push, so a device that's been asleep can't write old data over newer data:
 
 - Merging is **per item**: the most recent edit wins for the title and status. Notes from every device are **combined**, so a note logged on your phone and a rename on your desktop both survive.
@@ -65,7 +67,7 @@ Worker → **Settings → Variables and Secrets**:
 
 | Variable | Type | Value |
 |---|---|---|
-| `ALLOWED_ORIGINS` | Text | `https://your.instance.url` |
+| `ALLOWED_ORIGINS` | Text | `https://badbox29.github.io` |
 | `GOOGLE_CLIENT_ID` | Text | Your Google OAuth client ID (only needed for Google sign-in) |
 
 `ALLOWED_ORIGINS` is the origin only, no path. Add `http://localhost:8080` (comma-separated) if you want to test locally.
@@ -98,16 +100,25 @@ Open the app and choose **No — start fresh**, enter your Worker URL, then **Us
 
 ## Security model
 
-Same as Refectory:
+**What the Worker can see:** an account id, a few envelope fields (`format`, `authMethod`, `lastModified`, key-wrapping parameters) and ciphertext. Not your tasks, notes, names or token.
 
-- **Token accounts** sign every request with HMAC-SHA256, using a key derived (HKDF) from the token. The token itself never travels as a bearer credential. Signatures expire after 5 minutes.
-- **Google accounts**: the Worker verifies the Google ID token (RS256 against Google's published keys) once, then mints a random per-account **write key**. Requests are signed with that, so sync keeps working after the 1-hour Google token expires. **Sign out on all devices** in Settings deletes the write key.
-- **Token → Google upgrade** requires both a valid Google sign-in and an HMAC proof of the old token. Afterwards the old token returns `410 Gone`, and other devices on it are sent to Google sign-in.
+- **End-to-end encryption.** Data is encrypted in the browser with a random 256-bit data key (AES-GCM). The data key is wrapped with a key derived from your passphrase (PBKDF2-SHA256, 600,000 iterations, random salt), and the wrapped copy is stored alongside the ciphertext so any device with the passphrase can open it. Each device keeps the unwrapped data key in its own storage, so the passphrase is asked once per device. Changing the passphrase re-wraps the same data key; other devices pick up the change automatically.
+- **Token accounts: the token never leaves the device.** The storage id is a SHA-256 fingerprint of the token (`r1…`), and requests are HMAC-signed with a key derived from the token (HKDF) that's registered with the Worker once. Neither reveals the token. Anyone with access to the Worker or its logs could overwrite or delete data, but not read it — tampering fails decryption.
+- **Google accounts.** The Worker verifies the Google ID token (RS256 against Google's published keys) once, then mints a random per-account **write key** used to sign requests, so sync keeps working after the 1-hour Google token expires. **Sign out on all devices** in Settings deletes the write key. Google identifies *who* you are; your passphrase is still what protects the data.
+- **Token → Google upgrade** requires a valid Google sign-in plus a request signed as the token account. The encrypted data moves as-is, so the passphrase keeps working. Afterwards the old account id returns `410 Gone`.
 - CORS is locked to `ALLOWED_ORIGINS`. `/auth/*` routes are rate-limited per IP; storage is rate-limited per account.
 
-`HMAC_SALT` (`rounds-hmac-v1`) must match in `worker/worker.js` and `js/app.js`, and must never change after deployment, or every existing signature stops verifying.
+**What it doesn't protect against:** someone with access to an unlocked device or browser profile (data, token and data key sit in the browser's storage), or a compromised copy of the app's own code — the page is trusted, and so is Google's sign-in script it loads.
 
----
+`HMAC_SALT` (`rounds-hmac-v1`) must match in `worker/worker.js` and `js/app.js` and must never change after deployment.
+
+### Upgrading from v2.0.x
+
+Deploy the new `worker.js` and the new site files together; nothing else changes (same KV namespace and variables). Each existing account upgrades itself the next time it syncs:
+
+1. A **token** account proves its token to the Worker one last time (`/auth/register` with `legacyToken`). The Worker moves its data to the fingerprint id and deletes every key that contained the raw token. Requests to the old raw-token address return `410`.
+2. The app finds the old unencrypted copy and asks for a passphrase (**Encrypt your synced data**). Existing tasks and notes are encrypted with it and the plaintext copy on the Worker is overwritten.
+3. Other devices are asked for the same passphrase on their next sync. Until a device sets or enters it, sync pauses there and nothing is uploaded; local data stays usable.
 
 ## Worker routes
 
@@ -119,6 +130,7 @@ Same as Refectory:
 | `POST` | `/auth/verify` | Re-verify a stored Google credential at boot |
 | `POST` | `/auth/writekey` | Mint/return the account's write key (Google) |
 | `POST` | `/auth/revokekeys` | Delete the write key (signs out every device) |
+| `POST` | `/auth/register` | Register a token account's signing key (and move a pre-v2.1 account) |
 | `POST` | `/auth/migrate` | One-way token → Google migration |
 | `GET` | `/storage/:token` | List keys |
 | `GET` | `/storage/:token/:key` | Read a value |
@@ -127,12 +139,25 @@ Same as Refectory:
 
 ## Data
 
-One JSON document per account at KV key `user:{token}:profile`:
+One document per account at KV key `user:{accountId}:profile`, where `accountId` is `r1…` (token accounts) or `google:{sub}`. What the Worker stores:
 
 ```json
 {
+  "format": "rounds-e2e-v1",
   "authMethod": "token",
-  "userToken": "…",
+  "lastModified": 1764003600000,
+  "keyId": "m3x9k2abc",
+  "wrapAt": 1764000000000,
+  "kdf":  { "name": "PBKDF2-SHA256", "iter": 600000, "salt": "…" },
+  "wrap": { "iv": "…", "ct": "…" },
+  "data": { "iv": "…", "ct": "…" }
+}
+```
+
+Inside `data` (decrypted in the browser):
+
+```json
+{
   "items": {
     "m3x9k2abc": {
       "id": "m3x9k2abc",
@@ -149,4 +174,4 @@ One JSON document per account at KV key `user:{token}:profile`:
 }
 ```
 
-`status` is `"active"` or `"done"` (with `doneAt`). An empty `text` is a "seen, no notes" check-in.
+`status` is `"active"` or `"done"` (with `doneAt`). An empty `text` is a "seen, no notes" check-in. The token, Worker URL and account type are kept on the device only.
