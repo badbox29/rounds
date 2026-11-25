@@ -65,7 +65,7 @@ Worker → **Settings → Variables and Secrets**:
 
 | Variable | Type | Value |
 |---|---|---|
-| `ALLOWED_ORIGINS` | Text | `https://badbox29.github.io` |
+| `ALLOWED_ORIGINS` | Text | `https://your.instance.url` |
 | `GOOGLE_CLIENT_ID` | Text | Your Google OAuth client ID (only needed for Google sign-in) |
 
 `ALLOWED_ORIGINS` is the origin only, no path. Add `http://localhost:8080` (comma-separated) if you want to test locally.
