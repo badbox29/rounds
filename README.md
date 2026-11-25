@@ -13,7 +13,8 @@ No build tools, no npm, no framework. Static files on GitHub Pages and a Cloudfl
 - **Progress strip**: the header fills in one segment per item as you check in, with a "3 of 7 seen today" count.
 - **Done & archive**: **Mark done & archive** moves an item to the Archive tab with all its notes. The archive is searchable by title and note text, and items can go back on rounds.
 - **Undo** on check-ins, archiving, deleting and note removal. It still works after the change has synced.
-- **Rename** and **delete** items, remove individual notes.
+- **Descriptions**: give an item an optional description — completion requirements, what done looks like — when you add it (**+ Add a description**) or later with **Edit**. It shows at the top of the open card (and as the preview until the first note), and archive search covers it.
+- **Edit** (title and description) and **delete** items, remove individual notes.
 - **Copy backup**: Settings → Your data copies every item and note as JSON.
 - **Light and dark mode** follow the system setting.
 
@@ -162,6 +163,7 @@ Inside `data` (decrypted in the browser):
     "m3x9k2abc": {
       "id": "m3x9k2abc",
       "title": "Vendor quote — firewall",
+      "description": "Done when: signed quote from two vendors, approved by finance.",
       "createdAt": 1764000000000,
       "updatedAt": 1764003600000,
       "status": "active",
