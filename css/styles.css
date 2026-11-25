@@ -209,3 +209,21 @@ form.edit .form-label { margin: 4px 0 0; }
 .pp-err  { color: var(--red); font-weight: 600; min-height: 1.2em; margin: 0 0 8px; font-size: 15px; }
 #pp-forgot { margin-right: auto; }
 input[type=checkbox] { width: 18px; height: 18px; accent-color: var(--band); }
+
+/* ── Morning reminder settings ───────────────────────────────── */
+.rem-switch { font-weight: 600; min-height: 36px; }
+.rem-grid { display: grid; grid-template-columns: minmax(0, 8rem) minmax(0, 1fr); gap: 10px; }
+select.input { appearance: auto; min-height: 46px; }
+.days { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 4px; }
+.days label { position: relative; }
+.days input { position: absolute; opacity: 0; inset: 0; margin: 0; cursor: pointer; width: 100%; height: 100%; }
+.days span {
+  display: grid; place-items: center; min-height: 44px; padding: 0 2px; border-radius: 10px;
+  border: 1.5px solid var(--line); font-weight: 600; font-size: 15px; color: var(--muted); background: var(--paper);
+}
+.days input:checked + span { background: var(--band); border-color: var(--band); color: #fff; }
+.days input:focus-visible + span { outline: 3px solid var(--seen); outline-offset: 2px; }
+.rem-msg { margin: 0; font-size: 15px; font-weight: 500; min-height: 1.2em; }
+.rem-msg.bad { color: var(--red); }
+.rem-msg.good { color: var(--green); }
+.settings-section a { color: var(--seen); }
