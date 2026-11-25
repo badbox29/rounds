@@ -8,7 +8,7 @@
  */
 'use strict';
 
-const APP_VERSION         = '2.2.0';
+const APP_VERSION         = '2.3.0';
 // The Worker URL is never built in. Each browser stores its own (entered in
 // the setup wizard or Settings) in localStorage, so anyone can run this page
 // from the same GitHub repo against their own private Worker. It is never
@@ -790,6 +790,7 @@ function renderEncryptionSection() {
 function openSettings() {
   renderAccountSection();
   renderEncryptionSection();
+  renderReminderSection();
   $('settings-worker-url').value = App.data.workerUrl || '';
   $('settings-signout-all').style.display = Auth.isGoogleAccount() ? '' : 'none';
   $('settings-sync-info').textContent = App.lastSyncAt
@@ -1000,6 +1001,124 @@ $('settings-e2e-btn').addEventListener('click', e => {
   App.e2e.dismissed = false;
   openPassphrase(e.currentTarget.dataset.mode || 'set');
 });
+
+// ── Morning reminder (ntfy, sent by the Worker's cron) ────────────
+// Settings live on the Worker at user:{id}:reminder, outside the encrypted
+// profile, because the Worker has to read them to send. They hold no task data.
+const DAY_ORDER  = [1, 2, 3, 4, 5, 6, 0];
+const DAY_LABELS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+const deviceTz   = () => { try { return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'; } catch { return 'UTC'; } };
+const randomTopic = () => 'rounds-' + [...randBytes(10)].map(b => (b % 36).toString(36)).join('');
+const appUrl = () => location.origin + location.pathname;
+
+function reminderDefaults() {
+  return { enabled: false, time: '08:00', days: [1, 2, 3, 4, 5], tz: deviceTz(), server: 'https://ntfy.sh', topic: randomTopic(), token: '' };
+}
+
+async function reminderFetch(method, path, obj) {
+  const base = getWorkerUrl(), token = App.data?.userToken;
+  if (!base || !token) throw new Error('Set a Worker URL first.');
+  if (!await ensureRegistered()) throw new Error('Couldn’t reach your Worker.');
+  const id   = await storageId();
+  const body = obj ? JSON.stringify(obj) : '';
+  const headers = { ...(obj ? { 'Content-Type': 'application/json' } : {}), ...await Auth._authHeaders(method, token, body) };
+  const res  = await fetch(`${base}${path(encodeURIComponent(id))}`, { method, headers, body: obj ? body : undefined });
+  const data = await res.json().catch(() => ({}));
+  if (res.status === 401 || res.status === 403) handleAuthFailure();
+  return { res, data };
+}
+
+function remMsg(text, kind = '') {
+  const el = $('rem-msg');
+  el.textContent = text;
+  el.className = `rem-msg ${kind}`;
+}
+
+function describeReminder(r) {
+  if (!r.enabled) return 'Reminder is off.';
+  const days = r.days.length === 7 ? 'every day'
+    : (r.days.join() === '1,2,3,4,5' ? 'weekdays' : DAY_ORDER.filter(d => r.days.includes(d)).map(d => DAY_LABELS[d]).join(', '));
+  const [h, m] = r.time.split(':').map(Number);
+  const t = new Date(2000, 0, 1, h, m).toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
+  return `On — ${days} at ${t} (${r.tz.replace(/_/g, ' ')}).${r.lastError ? ' Last attempt failed: ' + r.lastError : ''}`;
+}
+
+function fillReminder(r) {
+  $('rem-enabled').checked = !!r.enabled;
+  $('rem-time').value = r.time || '08:00';
+  const sel = $('rem-tz');
+  if (!sel.options.length) {
+    let zones = [];
+    try { zones = Intl.supportedValuesOf('timeZone'); } catch {}
+    if (!zones.includes(deviceTz())) zones.unshift(deviceTz());
+    sel.innerHTML = zones.map(z => `<option value="${esc(z)}">${esc(z.replace(/_/g, ' '))}</option>`).join('');
+  }
+  if (![...sel.options].some(o => o.value === r.tz)) sel.insertAdjacentHTML('afterbegin', `<option value="${esc(r.tz)}">${esc(r.tz)}</option>`);
+  sel.value = r.tz;
+  $('rem-days').innerHTML = DAY_ORDER.map(d =>
+    `<label><input type="checkbox" value="${d}"${r.days.includes(d) ? ' checked' : ''} aria-label="${DAY_LABELS[d]}"><span>${DAY_LABELS[d]}</span></label>`).join('');
+  $('rem-server').value = r.server || 'https://ntfy.sh';
+  $('rem-topic').value = r.topic || randomTopic();
+  $('rem-token').value = r.token || '';
+}
+
+function readReminder() {
+  return {
+    enabled: $('rem-enabled').checked,
+    time:    $('rem-time').value || '08:00',
+    days:    [...$('rem-days').querySelectorAll('input:checked')].map(i => +i.value),
+    tz:      $('rem-tz').value || deviceTz(),
+    server:  $('rem-server').value.trim() || 'https://ntfy.sh',
+    topic:   $('rem-topic').value.trim(),
+    token:   $('rem-token').value.trim(),
+    appUrl:  appUrl(),
+  };
+}
+
+async function renderReminderSection() {
+  const show = !isGuest() && !!getWorkerUrl();
+  $('settings-reminder').style.display = show ? '' : 'none';
+  if (!show) return;
+  remMsg('Loading…');
+  try {
+    const { res, data } = await reminderFetch('GET', id => `/storage/${id}/reminder`);
+    const r = res.ok ? { ...reminderDefaults(), ...(data.value || {}) } : reminderDefaults();
+    fillReminder(r);
+    remMsg(res.ok ? describeReminder(r) : (res.status === 404 ? 'Reminder is off.' : `Couldn’t load reminder settings (HTTP ${res.status}).`),
+      res.ok || res.status === 404 ? '' : 'bad');
+  } catch (e) {
+    fillReminder(reminderDefaults());
+    remMsg(e.message || 'Couldn’t reach your Worker.', 'bad');
+  }
+}
+
+$('rem-save').addEventListener('click', async () => {
+  const r = readReminder();
+  if (r.enabled && !r.days.length) return remMsg('Pick at least one day.', 'bad');
+  if (!/^[A-Za-z0-9_-]{1,64}$/.test(r.topic)) return remMsg('Topic: letters, numbers, - or _ only.', 'bad');
+  $('rem-save').disabled = true;
+  try {
+    const { res, data } = await reminderFetch('PUT', id => `/storage/${id}/reminder`, r);
+    if (res.ok) { fillReminder({ ...reminderDefaults(), ...data.value }); remMsg('Saved. ' + describeReminder(data.value), 'good'); }
+    else remMsg(data.error || `Couldn’t save (HTTP ${res.status}).`, 'bad');
+  } catch (e) { remMsg(e.message || 'Couldn’t reach your Worker.', 'bad'); }
+  finally { $('rem-save').disabled = false; }
+});
+
+$('rem-test').addEventListener('click', async () => {
+  const r = readReminder();
+  if (!/^[A-Za-z0-9_-]{1,64}$/.test(r.topic)) return remMsg('Topic: letters, numbers, - or _ only.', 'bad');
+  $('rem-test').disabled = true;
+  remMsg('Sending…');
+  try {
+    const { res, data } = await reminderFetch('POST', id => `/reminder/${id}/test`, r);
+    if (res.ok && data.ok) remMsg('Test sent — check the ntfy app.', 'good');
+    else remMsg(data.error || `Couldn’t send (HTTP ${res.status}).`, 'bad');
+  } catch (e) { remMsg(e.message || 'Couldn’t reach your Worker.', 'bad'); }
+  finally { $('rem-test').disabled = false; }
+});
+
+$('rem-copy').addEventListener('click', () => copyText($('rem-topic').value, 'Topic copied ✓'));
 
 // ── Passphrase dialog ─────────────────────────────────────────────
 // Modes: set (first time, or upgrading an unencrypted account), enter (a new
