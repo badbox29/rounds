@@ -126,11 +126,8 @@ const Auth = (() => {
     remove: (key)      => { try { localStorage.removeItem(key); } catch {} },
   };
 
-  // ── HMAC request signing (token accounts) ────────────────────────
-  // Derives a signing key from the token via HKDF and signs every
-  // worker request. The raw token never travels as a bare bearer
-  // credential. Transparent to the user — no UX change.
-  // Must match the derivation in auth-worker.js / worker.js exactly.
+  // ── HMAC request signing ─────────────────────────────────────────
+  // Every request is signed. Must match verifyHmac() in worker.js exactly.
 
   async function _deriveHmacKey(secret) {
     const enc    = new TextEncoder();
@@ -165,6 +162,60 @@ const Auth = (() => {
     const sig      = btoa(String.fromCharCode(...new Uint8Array(sigBytes)))
       .replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
     return { 'X-Timestamp': timestamp, 'X-Signature': sig };
+  }
+
+  // ── Token-account identity (Rounds v2.1) ─────────────────────────
+  // The token never leaves the device. The Worker only ever sees:
+  //   accountId — "r1" + SHA-256 fingerprint of the token (the storage key)
+  //   authKey   — an HKDF-derived signing secret, registered once
+  // Neither one lets anyone recover the token.
+  const _b64u = buf => btoa(String.fromCharCode(...new Uint8Array(buf)))
+    .replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+  const _idCache = new Map(), _keyCache = new Map();
+
+  async function accountIdFor(token) {
+    if(!token || token.startsWith('google:')) return token;
+    if(!_idCache.has(token)) {
+      const h = await crypto.subtle.digest('SHA-256', new TextEncoder().encode('rounds-account-v1:' + token));
+      _idCache.set(token, 'r1' + _b64u(h));
+    }
+    return _idCache.get(token);
+  }
+
+  async function authKeyFor(token) {
+    if(!_keyCache.has(token)) {
+      const enc = new TextEncoder();
+      const km  = await crypto.subtle.importKey('raw', enc.encode(token), { name: 'HKDF' }, false, ['deriveBits']);
+      const bits = await crypto.subtle.deriveBits(
+        { name: 'HKDF', hash: 'SHA-256', salt: enc.encode(C?.hmacSalt || 'rounds-hmac-v1'), info: enc.encode('rounds-auth-key-v1') },
+        km, 256);
+      _keyCache.set(token, [...new Uint8Array(bits)].map(b => b.toString(16).padStart(2,'0')).join(''));
+    }
+    return _keyCache.get(token);
+  }
+
+  // Register this account's signing key with the Worker (idempotent).
+  // legacy: also prove ownership the pre-v2.1 way, so the Worker can move an
+  // account that is still stored under the raw token. That one request is the
+  // last time the token itself is sent.
+  async function registerToken(token, { legacy = false, base } = {}) {
+    base = (base || workerBase() || '').replace(/\/+$/,'');
+    if(!base || !token || token.startsWith('google:')) return { ok: false };
+    const accountId = await accountIdFor(token);
+    const authKey   = await authKeyFor(token);
+    const body      = JSON.stringify(legacy ? { accountId, authKey, legacyToken: token } : { accountId, authKey });
+    const headers   = { 'Content-Type': 'application/json' };
+    if(legacy) Object.assign(headers, await _signRequest('POST', token, body).catch(() => ({})));
+    try {
+      const res  = await fetch(`${base}/auth/register`, { method: 'POST', headers, body });
+      const data = await res.json().catch(() => ({}));
+      return { ok: res.ok && !!data.ok, status: res.status, moved: !!data.moved, error: data.error };
+    } catch { return { ok: false, status: 0 }; }
+  }
+
+  // Headers for a token account, signed with its derived key.
+  async function _tokenHeaders(method, token, body) {
+    return _signRequest(method, await accountIdFor(token), body, await authKeyFor(token));
   }
 
   // ── Write key (Google accounts) ──────────────────────────────────
@@ -227,7 +278,7 @@ const Auth = (() => {
   // _authHeaders(method, token, body) — returns the correct auth headers
   // for a worker request based on current account type.
   //   Google → HMAC signed with the write key, or Bearer if none yet
-  //   Token  → HMAC signed with the account token
+  //   Token  → HMAC signed with the token's derived auth key
   async function _authHeaders(method, token, body) {
     if(isGoogleAccount()) {
       const wkey = getWriteKey();
@@ -239,7 +290,7 @@ const Auth = (() => {
       const idToken = store.get(C.storageAuthKey);
       return idToken ? { 'Authorization': `Bearer ${idToken}` } : {};
     }
-    try { return await _signRequest(method, token, body); } catch { return {}; }
+    try { return await _tokenHeaders(method, token, body); } catch { return {}; }
   }
 
   // ── Token generation ─────────────────────────────────────────────
@@ -1129,13 +1180,25 @@ const Auth = (() => {
       C.setData(d);
 
       let remote = null;
-      try {
-        const base    = workerUrl.replace(/\/+$/,'');
-        const hmacHdrs = await _signRequest('GET', token, '').catch(() => ({}));
-        const res = await fetch(`${base}/storage/${encodeURIComponent(token)}/profile`, {
-          headers: hmacHdrs,
+      const base = workerUrl.replace(/\/+$/,'');
+      const load = async () => {
+        const id  = await accountIdFor(token);
+        const res = await fetch(`${base}/storage/${encodeURIComponent(id)}/profile`, {
+          headers: await _tokenHeaders('GET', token, ''),
         });
-        if(res.ok) { const j = await res.json(); remote = j.value ?? j; }
+        if(res.ok) { const j = await res.json(); return { remote: j.value ?? j }; }
+        return { status: res.status };
+      };
+      try {
+        let r = await load();
+        // Not registered yet: the account may still be stored the pre-v2.1
+        // way. Prove ownership once so the Worker can move it, then retry.
+        if(!r.remote && r.status === 401) {
+          statusEl.textContent = 'Upgrading account security…';
+          const reg = await registerToken(token, { legacy: true, base });
+          if(reg.ok) r = await load();
+        }
+        remote = r.remote || null;
       } catch {}
 
       if(!remote) {
@@ -1148,7 +1211,10 @@ const Auth = (() => {
       }
 
       const merged = C.mergeData(remote);
-      merged.workerUrl = workerUrl;
+      merged.workerUrl  = workerUrl;
+      merged.userToken  = token;      // never stored remotely any more
+      merged.authMethod = 'token';
+      merged.accountVersion = 2;
       C.onSignedIn(merged, false);
       C.closeModal('modal-account-setup');
       C.startSyncPing();
@@ -1427,10 +1493,11 @@ const Auth = (() => {
       }
 
       const base        = workerBase();
-      const migrateBody = JSON.stringify({ idToken, oldToken });
-      // Sign with oldToken via HMAC directly — not _authHeaders which checks
+      const oldId       = await accountIdFor(oldToken);
+      const migrateBody = JSON.stringify({ idToken, oldId });
+      // Sign as the token account directly — not _authHeaders, which checks
       // account type and could send Bearer if authMethod has changed.
-      const hmacHdrs    = await _signRequest('POST', oldToken, migrateBody).catch(() => ({}));
+      const hmacHdrs    = await _tokenHeaders('POST', oldToken, migrateBody).catch(() => ({}));
       statusEl.style.color = 'var(--gold2, #b8985a)';
       statusEl.textContent = 'Migrating account…';
 
@@ -1709,6 +1776,8 @@ const Auth = (() => {
     generateToken,          // 128-bit base64url token
     isLegacyToken,          // detect old Math.random() tokens
     _authHeaders,           // build auth headers for worker requests (HMAC or Bearer)
+    accountIdFor,           // storage id for a token (fingerprint) or Google account
+    registerToken,          // register a token account's signing key (and move legacy data)
   };
 
 })();

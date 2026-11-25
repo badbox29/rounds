@@ -8,7 +8,7 @@
  */
 'use strict';
 
-const APP_VERSION         = '2.0.1';
+const APP_VERSION         = '2.1.0';
 // The Worker URL is never built in. Each browser stores its own (entered in
 // the setup wizard or Settings) in localStorage, so anyone can run this page
 // from the same GitHub repo against their own private Worker. It is never
@@ -27,7 +27,9 @@ const SYNC_INTERVAL_MS    = 60_000;
 const PUSH_DEBOUNCE_MS    = 1500;
 const FOREGROUND_PULL_MS  = 60_000;
 const TOMBSTONE_DAYS      = 180;
-const LOCAL_FIELDS        = ['authMethod', 'userToken', 'workerUrl', 'linkedGoogle'];
+// Device/account fields: never merged from the server, never inside the
+// encrypted payload. The token in particular is never uploaded.
+const LOCAL_FIELDS        = ['authMethod', 'userToken', 'workerUrl', 'linkedGoogle', 'accountVersion'];
 
 // ── Small helpers ─────────────────────────────────────────────────
 const $   = id => document.getElementById(id);
@@ -61,6 +63,8 @@ const App = {
   authPromptOpen: false,
   storageBlocked: false,
   renderedDay: dayKey(Date.now()),
+  // End-to-end encryption state for this visit
+  e2e: { mode: null, remote: null, dismissed: false, overwriteKeyId: null, upgrade: false },
 };
 const View = {
   tab: location.hash === '#archive' ? 'archive' : 'rounds',
@@ -76,6 +80,7 @@ function defaultData() {
     authMethod: null,
     userToken: Auth.generateToken(),
     workerUrl: '',
+    accountVersion: 2,     // 2 = token account uses a fingerprint id (v2.1+)
     items: {},
     tombstones: {},
     lastModified: Date.now(),
@@ -85,8 +90,12 @@ function defaultData() {
 function mergeData(raw) {
   const d = defaultData();
   if (!isObj(raw)) return d;
+  // An encrypted envelope can't be read here; the sync opens it.
+  if (raw.format === 'rounds-e2e-v1') return { ...d, authMethod: raw.authMethod || d.authMethod };
   return {
     ...d, ...raw,
+    // Token accounts saved before v2.1 still need their one-time move.
+    accountVersion: raw.accountVersion ?? (raw.authMethod === 'token' ? 1 : 2),
     items:      isObj(raw.items) ? raw.items : {},
     tombstones: isObj(raw.tombstones) ? raw.tombstones : {},
   };
@@ -190,24 +199,113 @@ function removeTask(id) {
   changed();
 }
 
+// ── End-to-end encryption ─────────────────────────────────────────
+// Everything synced is sealed in the browser with a random data key
+// (AES-256-GCM). That key is wrapped with a key derived from the user's
+// passphrase (PBKDF2-SHA256, 600k rounds), and the wrapped copy rides along in
+// the envelope so any device that knows the passphrase can open it. The
+// passphrase never leaves the device; the Worker only ever stores ciphertext.
+// This device keeps the unwrapped data key, so the passphrase is asked once
+// per device.
+const E2E_FORMAT     = 'rounds-e2e-v1';
+const PBKDF2_ITER    = 600_000;
+const DEK_KEY        = 'rounds_dek';
+const REG_KEY        = 'rounds_registered';
+const MIN_PASSPHRASE = 10;
+
+const te = new TextEncoder(), td = new TextDecoder();
+function toB64(buf) {
+  const b = new Uint8Array(buf);
+  let s = '';
+  for (let i = 0; i < b.length; i += 0x8000) s += String.fromCharCode.apply(null, b.subarray(i, i + 0x8000));
+  return btoa(s);
+}
+const fromB64    = s => Uint8Array.from(atob(s), c => c.charCodeAt(0));
+const randBytes  = n => crypto.getRandomValues(new Uint8Array(n));
+const isEnvelope = v => isObj(v) && v.format === E2E_FORMAT;
+const getDek     = () => { const d = ls.get(DEK_KEY); return d && d.key && d.keyId ? d : null; };
+
+async function passKey(pass, salt, iter) {
+  const km = await crypto.subtle.importKey('raw', te.encode(pass.normalize('NFKC')), 'PBKDF2', false, ['deriveKey']);
+  return crypto.subtle.deriveKey({ name: 'PBKDF2', hash: 'SHA-256', salt, iterations: iter },
+    km, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+}
+async function wrapDataKey(raw, pass) {
+  const salt = randBytes(16), iv = randBytes(12);
+  const k  = await passKey(pass, salt, PBKDF2_ITER);
+  const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv, additionalData: te.encode('rounds-dek-v1') }, k, raw);
+  return { kdf: { name: 'PBKDF2-SHA256', iter: PBKDF2_ITER, salt: toB64(salt) }, wrap: { iv: toB64(iv), ct: toB64(ct) }, wrapAt: Date.now() };
+}
+async function unwrapDataKey(env, pass) {
+  const k = await passKey(pass, fromB64(env.kdf.salt), env.kdf.iter);
+  return new Uint8Array(await crypto.subtle.decrypt(
+    { name: 'AES-GCM', iv: fromB64(env.wrap.iv), additionalData: te.encode('rounds-dek-v1') }, k, fromB64(env.wrap.ct)));
+}
+const dataKey = dek => crypto.subtle.importKey('raw', fromB64(dek.key), 'AES-GCM', false, ['encrypt', 'decrypt']);
+
+function innerData(d) {
+  const o = { ...d };
+  for (const k of LOCAL_FIELDS) delete o[k];
+  return o;
+}
+async function seal(d, dek) {
+  const iv = randBytes(12);
+  const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv, additionalData: te.encode(E2E_FORMAT) },
+    await dataKey(dek), te.encode(JSON.stringify(innerData(d))));
+  // Only these fields are readable by the Worker.
+  return {
+    format: E2E_FORMAT, authMethod: d.authMethod, lastModified: d.lastModified,
+    keyId: dek.keyId, wrapAt: dek.wrapAt, kdf: dek.kdf, wrap: dek.wrap,
+    data: { iv: toB64(iv), ct: toB64(ct) },
+  };
+}
+async function unseal(env, dek) {
+  const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: fromB64(env.data.iv), additionalData: te.encode(E2E_FORMAT) },
+    await dataKey(dek), fromB64(env.data.ct));
+  return JSON.parse(td.decode(pt));
+}
+
 // ── Worker sync ───────────────────────────────────────────────────
 const getWorkerUrl = () => (App.data?.workerUrl || '').replace(/\/+$/, '');
 // Read the account type straight from the data so these work before Auth.init().
 const isGuest  = () => !App.data?.authMethod || App.data.authMethod === 'guest';
 const isGoogle = () => App.data?.authMethod === 'google';
+const isToken  = () => App.data?.authMethod === 'token';
 const canSync  = () => !!App.data && !isGuest() && !!getWorkerUrl() && !!App.data.userToken;
+const storageId = () => Auth.accountIdFor(App.data.userToken);
 
+// Token accounts register the signing key they derive from the token, once
+// per device. Accounts made before v2.1 also prove the token one last time
+// so the Worker can move their data off the raw-token key.
+async function ensureRegistered() {
+  if (!isToken()) return true;
+  const id = await storageId();
+  if (ls.get(REG_KEY) === id) return true;
+  const legacy = App.data.accountVersion !== 2;
+  const r = await Auth.registerToken(App.data.userToken, { legacy, base: getWorkerUrl() });
+  if (r.status === 410) { handleMigrated(); return false; }
+  if (!r.ok) { App.lastSyncMsg = r.error || `register: HTTP ${r.status}`; return false; }
+  ls.set(REG_KEY, id);
+  App.data.accountVersion = 2;
+  saveLocal();
+  return true;
+}
+
+// Never uploads anything unencrypted: with no data key yet it does nothing,
+// and the next sync asks for a passphrase.
 async function pushToWorker() {
   const base = getWorkerUrl(), token = App.data?.userToken;
   if (!base || !token) return { ok: false, status: 0 };
-  const { workerUrl: _deviceOnly, ...payload } = App.data;   // this browser's setting, not account data
-  const body    = JSON.stringify(payload);
-  const headers = await Auth._authHeaders('PUT', token, body);
+  const dek = getDek();
+  if (!dek) return { ok: true, status: 0, deferred: true };
+  if (!await ensureRegistered()) return { ok: false, status: 0 };
   try {
-    const res = await fetch(`${base}/storage/${encodeURIComponent(token)}/profile`, {
+    const body    = JSON.stringify(await seal(App.data, dek));
+    const headers = await Auth._authHeaders('PUT', token, body);
+    const res = await fetch(`${base}/storage/${encodeURIComponent(await storageId())}/profile`, {
       method: 'PUT', headers: { 'Content-Type': 'application/json', ...headers }, body,
     });
-    if (res.status === 401 || res.status === 403) handleAuthFailure();
+    if (res.status === 401 || res.status === 403) { if (isToken()) ls.remove(REG_KEY); handleAuthFailure(); }
     if (res.status === 410) handleMigrated();
     return { ok: res.ok, status: res.status };
   } catch {
@@ -218,11 +316,12 @@ async function pushToWorker() {
 async function pullFromWorker() {
   const base = getWorkerUrl(), token = App.data?.userToken;
   if (!base || !token) return { ok: false, status: 0 };
-  const headers = await Auth._authHeaders('GET', token, '');
+  if (!await ensureRegistered()) return { ok: false, status: 0 };
   try {
-    const res = await fetch(`${base}/storage/${encodeURIComponent(token)}/profile`, { headers });
+    const headers = await Auth._authHeaders('GET', token, '');
+    const res = await fetch(`${base}/storage/${encodeURIComponent(await storageId())}/profile`, { headers });
     if (res.status === 410) { handleMigrated(); return { ok: false, status: 410 }; }
-    if (res.status === 401 || res.status === 403) handleAuthFailure();
+    if (res.status === 401 || res.status === 403) { if (isToken()) ls.remove(REG_KEY); handleAuthFailure(); }
     if (!res.ok) return { ok: false, status: res.status };
     const j = await res.json();
     return { ok: true, status: res.status, value: j.value ?? j };
@@ -238,8 +337,9 @@ function applyRemote(remote) {
   if (signature(App.data) !== before) render();
 }
 
-// Pull → merge → push (only if this device holds unsynced work, or the
-// Worker has nothing yet). One sync at a time; requests during a sync queue
+// Pull → decrypt → merge → encrypt → push. Pushes only when this device holds
+// unsynced work, the Worker has nothing yet, or the Worker still holds the
+// pre-v2.1 unencrypted copy. One sync at a time; requests during a sync queue
 // exactly one more.
 function syncNow(force = false) {
   if (!canSync()) return Promise.resolve(false);
@@ -248,13 +348,40 @@ function syncNow(force = false) {
     if (App.syncState !== 'session-expired') setSyncState('busy');
     const seq    = dirtySeq();
     const pulled = await pullFromWorker();
-    if (pulled.ok) applyRemote(pulled.value);
-    else if (pulled.status !== 404) return syncFailed(pulled.status);
+    if (!pulled.ok && pulled.status !== 404) return syncFailed(pulled.status);
+    const remote = pulled.ok ? pulled.value : null;
+    let mustPush = !remote || force || isDirty();
 
-    if (pulled.ok && !isDirty() && !force) return syncSucceeded();
+    if (isEnvelope(remote)) {
+      let dek = getDek();
+      if (!dek || dek.keyId !== remote.keyId) {
+        // "Forgot passphrase → replace synced copy": overwrite, don't open.
+        if (dek && App.e2e.overwriteKeyId === remote.keyId) mustPush = true;
+        else return needPassphrase('enter', remote);
+      } else {
+        // The passphrase was changed on another device: adopt the newer wrap.
+        if ((remote.wrapAt || 0) > (dek.wrapAt || 0)) {
+          dek = { ...dek, kdf: remote.kdf, wrap: remote.wrap, wrapAt: remote.wrapAt };
+          ls.set(DEK_KEY, dek);
+        }
+        try { applyRemote(await unseal(remote, dek)); }
+        catch { return needPassphrase('enter', remote); }
+        if ((dek.wrapAt || 0) > (remote.wrapAt || 0)) mustPush = true;
+      }
+    } else if (remote) {
+      // Unencrypted copy from before v2.1: merge it in, then replace it.
+      applyRemote(remote);
+      App.e2e.upgrade = true;
+      mustPush = true;
+    }
+
+    if (!getDek()) return needPassphrase('set');
+    if (!mustPush) return syncSucceeded();
 
     const pushed = await pushToWorker();
     if (!pushed.ok) return syncFailed(pushed.status);
+    App.e2e.overwriteKeyId = null;
+    App.e2e.upgrade = false;
     if (!clearDirty(seq)) App.again = true;
     return syncSucceeded();
   })();
@@ -262,6 +389,15 @@ function syncNow(force = false) {
     App.syncing = null;
     if (App.again) { App.again = false; scheduleSync(); }
   });
+}
+
+// Sync pauses (nothing is uploaded) until this device has the data key.
+function needPassphrase(mode, remote = null) {
+  App.e2e.mode = mode;
+  App.e2e.remote = remote;
+  setSyncState('locked');
+  if (!App.e2e.dismissed && !$('modal-passphrase').classList.contains('open')) openPassphrase(mode);
+  return false;
 }
 
 function syncSucceeded() {
@@ -330,6 +466,7 @@ function renderSyncPill() {
   else if (!getWorkerUrl())                       { text = 'Sync not set up'; cls = 'bad'; }
   else if (App.syncState === 'busy')              { text = 'Syncing…'; cls = 'busy'; }
   else if (App.syncState === 'session-expired')   { text = 'Sign in to sync'; cls = 'bad'; }
+  else if (App.syncState === 'locked')            { text = App.e2e.mode === 'enter' ? 'Locked' : 'Set passphrase'; cls = 'bad'; }
   else if (App.syncState === 'push-failed')       { text = 'Not synced'; cls = 'bad'; }
   else if (App.syncState === 'offline')           { text = 'Offline'; cls = 'bad'; }
   else if (App.lastSyncAt)                        { text = 'Synced'; cls = 'ok'; }
@@ -347,6 +484,11 @@ function renderBanner() {
     html = 'This browser refused to save. Changes may be lost when you close the page — copy a backup from Settings.';
   } else if (App.syncState === 'push-failed') {
     html = 'Changes aren’t reaching the sync server. They’re safe on this device. <button class="btn btn-sm btn-outline" data-act="retry-sync">Retry</button>';
+  } else if (App.syncState === 'locked') {
+    html = (App.e2e.mode === 'enter'
+      ? 'Sync is paused until you enter your passphrase on this device.'
+      : 'Sync is paused until you choose a passphrase. Your data is safe on this device.')
+      + ` <button class="btn btn-sm btn-outline" data-act="passphrase">${App.e2e.mode === 'enter' ? 'Enter passphrase' : 'Set passphrase'}</button>`;
   } else if (App.syncState === 'session-expired' && isGoogle()) {
     html = 'Your Google sign-in expired. Changes are saved on this device. <button class="btn btn-sm btn-outline" data-act="reauth">Sign in</button>';
   }
@@ -599,8 +741,24 @@ function renderAccountSection() {
   $('settings-worker-group').style.display = '';
 }
 
+function renderEncryptionSection() {
+  const sec = $('settings-e2e');
+  sec.style.display = isGuest() ? 'none' : '';
+  if (isGuest()) return;
+  const dek = getDek();
+  $('settings-e2e-status').textContent = dek
+    ? 'Tasks and notes are encrypted on this device before they’re uploaded. Your Worker only stores ciphertext.'
+    : (App.e2e.mode === 'enter'
+        ? 'Enter your passphrase to unlock sync on this device.'
+        : 'Choose a passphrase to turn on sync. Nothing is uploaded until you do.');
+  const btn = $('settings-e2e-btn');
+  btn.textContent = dek ? 'Change passphrase' : (App.e2e.mode === 'enter' ? 'Enter passphrase' : 'Set passphrase');
+  btn.dataset.mode = dek ? 'change' : (App.e2e.mode || 'set');
+}
+
 function openSettings() {
   renderAccountSection();
+  renderEncryptionSection();
   $('settings-worker-url').value = App.data.workerUrl || '';
   $('settings-signout-all').style.display = Auth.isGoogleAccount() ? '' : 'none';
   $('settings-sync-info').textContent = App.lastSyncAt
@@ -619,8 +777,8 @@ async function switchAccount() {
   const go = await appConfirm({
     title: 'Switch or create account',
     message: (isToken
-      ? 'Switching clears this device. Save this account’s token first — it’s the only way back to its data.'
-      : 'Switching clears this device. Your data stays in sync and comes back when you sign in again.') + unsynced,
+      ? 'Switching clears this device. Save this account’s token first — you’ll need it and your passphrase to get back in.'
+      : 'Switching clears this device. Your data stays in sync and comes back when you sign in again with your passphrase.') + unsynced,
     copyValue: isToken ? token : '',
     confirmLabel: 'Switch account',
     danger: true,
@@ -630,6 +788,9 @@ async function switchAccount() {
   Auth.stopSessionWatch();
   ls.remove(STORAGE_AUTH_KEY);
   ls.remove(STORAGE_WRITE_KEY);
+  ls.remove(DEK_KEY);
+  ls.remove(REG_KEY);
+  App.e2e = { mode: null, remote: null, dismissed: false, overwriteKeyId: null, upgrade: false };
   clearDirty();
   const workerUrl = App.data.workerUrl;
   App.data = defaultData();
@@ -742,14 +903,16 @@ $('toastUndo').addEventListener('click', () => { const f = undoFn; undoFn = null
 
 $('btnSettings').addEventListener('click', openSettings);
 $('syncPill').addEventListener('click', () => {
+  if (App.syncState === 'locked') { App.e2e.dismissed = false; openPassphrase(App.e2e.mode || 'set'); return; }
   if (canSync() && App.syncState !== 'session-expired') {
-    syncNow(true).then(ok => toast(ok ? 'Synced ✓' : 'Couldn’t sync — your work is safe on this device.'));
+    syncNow(true).then(ok => { if (App.syncState !== 'locked') toast(ok ? 'Synced ✓' : 'Couldn’t sync — your work is safe on this device.'); });
   } else openSettings();
 });
 $('banner').addEventListener('click', e => {
   const act = e.target.closest('[data-act]')?.dataset.act;
   if (act === 'retry-sync') syncNow(true);
   if (act === 'reauth') { App.authPromptOpen = false; handleAuthFailure(); }
+  if (act === 'passphrase') { App.e2e.dismissed = false; openPassphrase(App.e2e.mode || 'set'); }
 });
 document.querySelectorAll('[data-close]').forEach(b => b.addEventListener('click', () => closeModal(b.dataset.close)));
 $('modal-settings').addEventListener('click', e => { if (e.target.id === 'modal-settings') closeModal('modal-settings'); });
@@ -772,6 +935,7 @@ $('settings-worker-save').addEventListener('click', async () => {
 });
 $('settings-sync-now').addEventListener('click', async () => {
   const ok = await syncNow(true);
+  if (App.syncState === 'locked') { closeModal('modal-settings'); return; }
   toast(ok ? 'Synced ✓' : 'Couldn’t sync — your work is safe on this device.');
   openSettings();
 });
@@ -798,6 +962,131 @@ $('settings-signout-all').addEventListener('click', async () => {
 $('settings-export').addEventListener('click', () => {
   const { items, tombstones } = App.data;
   copyText(JSON.stringify({ app: 'Rounds', exportedAt: new Date().toISOString(), items, tombstones }, null, 2), 'Backup copied ✓');
+});
+
+$('settings-e2e-btn').addEventListener('click', e => {
+  closeModal('modal-settings');
+  App.e2e.dismissed = false;
+  openPassphrase(e.currentTarget.dataset.mode || 'set');
+});
+
+// ── Passphrase dialog ─────────────────────────────────────────────
+// Modes: set (first time, or upgrading an unencrypted account), enter (a new
+// device), change (rewrap the same data key), replace (forgot it: overwrite
+// the synced copy with this device's data under a new passphrase).
+const PP_TEXT = {
+  set: {
+    title: 'Choose a sync passphrase',
+    intro: 'Rounds encrypts your tasks and notes on this device before they’re uploaded, so your Worker only ever stores scrambled data. You’ll enter this passphrase once on each device.',
+    ok: 'Encrypt & sync',
+  },
+  upgrade: {
+    title: 'Encrypt your synced data',
+    intro: 'Rounds now encrypts everything before it leaves this device. Choose a passphrase — your existing tasks and notes will be encrypted with it, and the unencrypted copy on your Worker replaced. You’ll enter it once on each device.',
+    ok: 'Encrypt & sync',
+  },
+  enter: {
+    title: 'Enter your passphrase',
+    intro: 'Your synced data is end-to-end encrypted. Enter the passphrase you chose on your other device.',
+    ok: 'Unlock',
+  },
+  change: {
+    title: 'Change passphrase',
+    intro: 'Your other devices keep working and pick up the new passphrase automatically. Anyone signing in on a new device will need the new one.',
+    ok: 'Change passphrase',
+  },
+  replace: {
+    title: 'Start over with a new passphrase',
+    intro: 'The synced copy will be replaced with what’s on this device, encrypted with a new passphrase. Your other devices will ask for the new one.',
+    ok: 'Replace synced data',
+  },
+};
+
+function openPassphrase(mode) {
+  const key = mode === 'set' && App.e2e.upgrade ? 'upgrade' : mode;
+  const t = PP_TEXT[key] || PP_TEXT.set;
+  const confirming = mode !== 'enter';
+  $('modal-passphrase').dataset.mode = mode;
+  $('pp-title').textContent = t.title;
+  $('pp-intro').textContent = t.intro;
+  $('pp-ok').textContent = t.ok;
+  $('pp-ok').disabled = false;
+  $('pp-1').value = $('pp-2').value = '';
+  $('pp-1').autocomplete = confirming ? 'new-password' : 'current-password';
+  $('pp-1-label').textContent = mode === 'change' || mode === 'replace' ? 'New passphrase' : 'Passphrase';
+  $('pp-2-group').style.display = confirming ? '' : 'none';
+  $('pp-warn').style.display = confirming ? '' : 'none';
+  $('pp-forgot').style.display = mode === 'enter' ? '' : 'none';
+  $('pp-err').textContent = '';
+  openModal('modal-passphrase');
+  setTimeout(() => $('pp-1').focus(), 50);
+}
+
+async function submitPassphrase() {
+  const mode = $('modal-passphrase').dataset.mode;
+  const p1 = $('pp-1').value, p2 = $('pp-2').value;
+  const err = msg => { $('pp-err').textContent = msg; $('pp-ok').disabled = false; $('pp-ok').textContent = (PP_TEXT[mode] || PP_TEXT.set).ok; };
+  if (mode !== 'enter') {
+    if (p1.length < MIN_PASSPHRASE) return err(`Use at least ${MIN_PASSPHRASE} characters. A few unrelated words work well.`);
+    if (p1 !== p2) return err('The two passphrases don’t match.');
+  } else if (!p1) return err('Enter your passphrase.');
+  $('pp-ok').disabled = true;
+  $('pp-ok').textContent = 'Working…';
+
+  try {
+    if (mode === 'enter') {
+      const remote = App.e2e.remote;
+      if (!remote) { closeModal('modal-passphrase'); syncNow(true); return; }
+      let raw;
+      try { raw = await unwrapDataKey(remote, p1); }
+      catch { return err('That passphrase doesn’t match this account.'); }
+      ls.set(DEK_KEY, { keyId: remote.keyId, key: toB64(raw), kdf: remote.kdf, wrap: remote.wrap, wrapAt: remote.wrapAt || 0 });
+      closeModal('modal-passphrase');
+      setSyncState(null);
+      toast('Unlocked — syncing…');
+      if (await syncNow(true)) toast('Unlocked and synced ✓');
+      return;
+    }
+    if (mode === 'change') {
+      const dek = getDek();
+      if (!dek) return err('This device doesn’t have the encryption key yet.');
+      ls.set(DEK_KEY, { ...dek, ...await wrapDataKey(fromB64(dek.key), p1) });
+      markDirty();
+      closeModal('modal-passphrase');
+      toast((await syncNow(true)) ? 'Passphrase changed ✓' : 'Passphrase changed — it’ll sync when the Worker is reachable.');
+      return;
+    }
+    // set / replace: a fresh data key
+    const raw = randBytes(32);
+    if (mode === 'replace') App.e2e.overwriteKeyId = App.e2e.remote?.keyId || null;
+    ls.set(DEK_KEY, { keyId: newId(), key: toB64(raw), ...await wrapDataKey(raw, p1) });
+    markDirty();
+    closeModal('modal-passphrase');
+    setSyncState(null);
+    toast('Encrypting and syncing…');
+    if (await syncNow(true)) toast('Encrypted and synced ✓');
+  } catch (e) {
+    console.error('[Rounds] passphrase:', e);
+    err('Something went wrong — try again.');
+  }
+}
+
+$('pp-form').addEventListener('submit', e => { e.preventDefault(); submitPassphrase(); });
+$('pp-later').addEventListener('click', () => {
+  closeModal('modal-passphrase');
+  if (!getDek()) { App.e2e.dismissed = true; renderBanner(); }
+});
+$('pp-show').addEventListener('change', e => {
+  $('pp-1').type = $('pp-2').type = e.target.checked ? 'text' : 'password';
+});
+$('pp-forgot').addEventListener('click', async () => {
+  closeModal('modal-passphrase');
+  const go = await appConfirm({
+    title: 'Forgot your passphrase?',
+    message: 'It can’t be recovered — not even from your Worker. You can replace the synced copy with what’s on this device, protected by a new passphrase.\n\nAnything that exists only on your other devices will be lost, and they’ll ask for the new passphrase.',
+    confirmLabel: 'Replace synced data', danger: true,
+  });
+  openPassphrase(go ? 'replace' : 'enter');
 });
 
 // Save and push when the page is hidden; catch up when it comes back.
